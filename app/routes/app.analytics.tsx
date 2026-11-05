@@ -1,11 +1,6 @@
-import { Suspense, useCallback } from "react";
+import { useCallback } from "react";
 import type { HeadersFunction, LoaderFunctionArgs } from "react-router";
-import {
-  Await,
-  Link,
-  useLoaderData,
-  useSearchParams,
-} from "react-router";
+import { Link, useLoaderData, useSearchParams } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { isSupabaseConfigured } from "../lib/supabase.server";
@@ -21,8 +16,9 @@ import {
 import {
   analyticsAccessError,
   hasAnalyticsAccess,
+  resolvePlanTier,
 } from "../lib/billing.plans";
-import { getShopBillingState } from "../lib/billing.server";
+import { getShopBillingRecord } from "../lib/billing-records.server";
 import {
   analyticsFilterSummary,
   filtersToSearchParams,
@@ -47,23 +43,58 @@ import {
   RevenueMetricsPanel,
 } from "../components/AnalyticsCharts";
 import { AnalyticsFiltersBar } from "../components/AnalyticsFiltersBar";
-import { AnalyticsPageSkeletonLayout } from "../components/PageLoadingOverlay";
 import { DatabaseSetupBanner } from "../components/DatabaseSetupBanner";
 import { useAppNavigate } from "../hooks/useAppNavigate";
 
+/** Queries can outlast React's streaming abort on Vercel. Wait for them in the loader. */
+export const maxDuration = 60;
+
+type AnalyticsPayload = {
+  detail: TestAnalyticsDetail;
+  summaries: TestAnalyticsSummary[];
+  funnelTypeBreakdown: Array<{
+    funnelType: string;
+    shown: number;
+    converted: number;
+  }>;
+  fx: { rates: Record<string, number>; asOf: string };
+};
+
+async function loadAnalyticsPayload(
+  shop: string,
+  scope: { testIds: string[] | null; since: Date | null },
+): Promise<AnalyticsPayload | null> {
+  try {
+    const [detail, summaries, funnelTypeBreakdown, fx] = await Promise.all([
+      getFilteredDashboardAnalyticsDetail(shop, scope).catch(() => null),
+      getScopedTestAnalyticsSummaries(shop, scope).catch(() => []),
+      getFunnelTypeBreakdown(shop).catch(() => []),
+      getUsdFxRates().catch(() => null),
+    ]);
+    if (!detail || !fx) return null;
+    return { detail, summaries, funnelTypeBreakdown, fx };
+  } catch (error) {
+    console.error("Analytics payload failed:", error);
+    return null;
+  }
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const billingState = await getShopBillingState(request);
+  const billingRecord = await getShopBillingRecord(session.shop);
+  const tier = billingRecord?.hasActivePayment
+    ? resolvePlanTier(billingRecord.subscriptionName)
+    : null;
   const dbReady = isSupabaseConfigured();
   const filters = parseAnalyticsFilters(new URL(request.url).searchParams);
 
-  if (!hasAnalyticsAccess(billingState.tier)) {
+  if (!hasAnalyticsAccess(tier)) {
     return {
       accessDenied: true as const,
-      tier: billingState.tier,
+      tier,
       dbReady,
       filters,
-      analytics: Promise.resolve(null),
+      analytics: null as AnalyticsPayload | null,
       tests: [] as Awaited<ReturnType<typeof listTests>>,
     };
   }
@@ -78,31 +109,17 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     since: periodSince(filters.period),
   };
 
+  const analytics = dbReady
+    ? await loadAnalyticsPayload(session.shop, scope)
+    : null;
+
   return {
     accessDenied: false as const,
-    tier: billingState.tier,
+    tier,
     dbReady,
     filters,
     tests,
-    analytics: dbReady
-      ? Promise.all([
-          getFilteredDashboardAnalyticsDetail(session.shop, scope).catch(
-            () => null,
-          ),
-          getScopedTestAnalyticsSummaries(session.shop, scope).catch(() => []),
-          getFunnelTypeBreakdown(session.shop).catch(() => []),
-          getUsdFxRates().catch(() => null),
-        ])
-          .then(([detail, summaries, funnelTypeBreakdown, fx]) =>
-            detail && fx
-              ? { detail, summaries, funnelTypeBreakdown, fx, tests, filters }
-              : null,
-          )
-          .catch((error) => {
-            console.error("Analytics payload failed:", error);
-            return null;
-          })
-      : Promise.resolve(null),
+    analytics,
   };
 };
 
@@ -176,28 +193,22 @@ export default function AnalyticsPage() {
         </s-text>
       </s-box>
 
-      <Suspense fallback={<AnalyticsPageSkeletonLayout />}>
-        <Await resolve={analytics}>
-          {(resolved) =>
-            resolved ? (
-              <FullAnalyticsView
-                stats={resolved.detail}
-                summaries={resolved.summaries}
-                funnelTypeBreakdown={resolved.funnelTypeBreakdown}
-                tests={resolved.tests}
-                fx={resolved.fx}
-                displayCurrency={displayCurrency}
-                onDisplayCurrencyChange={setDisplayCurrency}
-              />
-            ) : (
-              <s-banner tone="info">
-                Analytics could not be loaded. Check your database connection and
-                try again.
-              </s-banner>
-            )
-          }
-        </Await>
-      </Suspense>
+      {analytics ? (
+        <FullAnalyticsView
+          stats={analytics.detail}
+          summaries={analytics.summaries}
+          funnelTypeBreakdown={analytics.funnelTypeBreakdown}
+          tests={tests}
+          fx={analytics.fx}
+          displayCurrency={displayCurrency}
+          onDisplayCurrencyChange={setDisplayCurrency}
+        />
+      ) : (
+        <s-banner tone="info">
+          Analytics could not be loaded. Check your database connection and try
+          again.
+        </s-banner>
+      )}
     </s-page>
   );
 }
