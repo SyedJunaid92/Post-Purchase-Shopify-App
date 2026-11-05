@@ -47,7 +47,7 @@
     "web-vitals": "^5.3.0"
   },
   "devDependencies": {
-    "@shopify/api-codegen-preset": "^2.0.0",
+    "@shopify/api-codegen-preset": "^3.0.0",
     "@shopify/polaris-types": "1.0.1",
     "@types/eslint": "^9.6.1",
     "@types/jsonwebtoken": "^9.0.9",
