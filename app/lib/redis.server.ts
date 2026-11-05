@@ -64,11 +64,13 @@ export async function cacheDel(...keys: string[]): Promise<void> {
 export const REDIS_KEYS = {
   activeTest: (shop: string) => `offer:active:${shop}`,
   fxUsd: "fx:usd",
+  shopCurrency: (shop: string) => `shop:currency:${shop}`,
   dashboard: (shop: string) => `analytics:dashboard:${shop}`,
 } as const;
 
 export const REDIS_TTL = {
   activeTest: 20,
   fxUsd: 60 * 60,
+  shopCurrency: 60 * 60 * 24,
   dashboard: 20,
 } as const;

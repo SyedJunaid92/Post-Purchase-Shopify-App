@@ -28,7 +28,7 @@ function orderAmountUsd(
   row: ConversionOrderRow,
   rates: Record<string, number>,
 ): number {
-  if (row.amountUsd != null && Number.isFinite(row.amountUsd) && row.amountUsd >= 0) {
+  if (row.amountUsd != null && Number.isFinite(row.amountUsd) && row.amountUsd > 0) {
     return row.amountUsd;
   }
 
@@ -40,7 +40,7 @@ function orderAmountUsd(
   try {
     return convertToUsd(row.amount, currency, rates);
   } catch {
-    return row.amount;
+    return 0;
   }
 }
 

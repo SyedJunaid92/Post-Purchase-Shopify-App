@@ -982,8 +982,14 @@ function readMoney(money) {
   if (!amount) return null;
   return {
     amount,
-    currency: money.currencyCode || "USD",
+    currency: normalizeCurrencyCode(money.currencyCode) || "USD",
   };
+}
+
+function normalizeCurrencyCode(value) {
+  if (typeof value !== "string") return null;
+  const code = value.trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(code) ? code : null;
 }
 
 function amountUsdFromMoneyBag(moneyBag) {
@@ -993,7 +999,38 @@ function amountUsdFromMoneyBag(moneyBag) {
 
   if (presentment?.currency === "USD") return presentment.amount;
   if (shop?.currency === "USD") return shop.amount;
+  // Neither leg is USD. The server converts the presentment amount.
   return null;
+}
+
+function shopCurrencyFromPurchase(calculatedPurchase) {
+  return (
+    normalizeCurrencyCode(
+      calculatedPurchase?.totalOutstandingSet?.shopMoney?.currencyCode,
+    ) ||
+    normalizeCurrencyCode(
+      calculatedPurchase?.updatedLineItems?.[0]?.totalPriceSet?.shopMoney
+        ?.currencyCode,
+    ) ||
+    normalizeCurrencyCode(
+      calculatedPurchase?.updatedLineItems?.[0]?.priceSet?.shopMoney
+        ?.currencyCode,
+    ) ||
+    null
+  );
+}
+
+function catalogRevenuePayload(offer, calculatedPurchase, amountNumber) {
+  const fixed = amountNumber.toFixed(2);
+  const currency =
+    shopCurrencyFromPurchase(calculatedPurchase) ||
+    normalizeCurrencyCode(offer?.priceCurrency);
+  if (!currency) return {};
+  return {
+    amount: fixed,
+    currency,
+    ...(currency === "USD" ? { amountUsd: fixed } : {}),
+  };
 }
 
 function parseMoneyAmount(value) {
@@ -1001,15 +1038,6 @@ function parseMoneyAmount(value) {
   const cleaned = String(value).replace(/[^0-9.]/g, "");
   const parsed = parseFloat(cleaned);
   return Number.isFinite(parsed) ? parsed : null;
-}
-
-function readPresentmentCurrency(calculatedPurchase) {
-  return (
-    calculatedPurchase?.totalOutstandingSet?.presentmentMoney?.currencyCode ||
-    calculatedPurchase?.updatedLineItems?.[0]?.totalPriceSet?.presentmentMoney
-      ?.currencyCode ||
-    "USD"
-  );
 }
 
 function configuredOfferAmount(offer) {
@@ -1053,13 +1081,7 @@ function conversionRevenuePayload(offer, calculatedPurchase) {
 
   const configured = configuredOfferAmount(offer);
   if (configured != null) {
-    const fixed = configured.toFixed(2);
-    const currency = readPresentmentCurrency(calculatedPurchase) || "USD";
-    return {
-      amount: fixed,
-      currency,
-      ...(currency === "USD" ? { amountUsd: fixed } : {}),
-    };
+    return catalogRevenuePayload(offer, calculatedPurchase, configured);
   }
 
   return {};
@@ -1083,14 +1105,15 @@ function trialStatsRevenuePayload(offer, calculatedPurchase) {
     return immediate;
   }
 
-  const fixed = configured.toFixed(2);
-  const currency =
-    immediate.currency || readPresentmentCurrency(calculatedPurchase) || "USD";
+  const catalog = catalogRevenuePayload(
+    offer,
+    calculatedPurchase,
+    configured,
+  );
+  if (!catalog.amount) return immediate;
 
   return {
-    amount: fixed,
-    currency,
-    ...(currency === "USD" ? { amountUsd: fixed } : {}),
+    ...catalog,
     revenueBasis: "subscription_recurring",
     chargeToday: "0",
   };

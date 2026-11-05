@@ -6,8 +6,9 @@ export const maxDuration = 60;
 
 /**
  * Vercel Cron: GET /api/cron/analytics-rollup every hour.
- * Replaces only today's analytics_daily rows. Past days are inserted once
- * when missing, and existing past rows are not deleted or rewritten.
+ * Replaces today's analytics_daily rows. Past days that stored non-USD
+ * revenue as $0 are rebuilt until that rewrite finishes. Other past days
+ * are inserted once when missing.
  */
 async function runRollup() {
   return refreshHourlyAnalyticsRollup();

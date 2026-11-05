@@ -64,6 +64,8 @@ export type PostPurchaseOffer = {
   isSubscription: boolean;
   sellingPlanName: string | null;
   changes: OfferChange[];
+  /** Shop currency of originalPrice and discountedPrice. */
+  priceCurrency?: string | null;
 };
 
 export type PostPurchaseFlowPayload = {

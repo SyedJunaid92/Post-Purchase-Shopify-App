@@ -1,8 +1,12 @@
 import { getAnalyticsSql } from "./analytics.server";
+import { getUsdFxRates } from "./fx.server";
 import { getRedis } from "./redis.server";
 
 const LOCK_KEY = "analytics:daily-rollup-lock";
 const BACKFILL_DAYS_PER_RUN = 40;
+const REWRITE_DAYS_PER_RUN = 20;
+/** Bump when revenue SQL changes so past days are rebuilt once. */
+const REVENUE_ROLLUP_REVISION = 2;
 
 export type DailyCombo = {
   variant: string;
@@ -118,6 +122,10 @@ async function createAnalyticsDailyTable(): Promise<void> {
       shop text PRIMARY KEY,
       oldest_filled date
     )`,
+    `ALTER TABLE analytics_rollup_state
+      ADD COLUMN IF NOT EXISTS revenue_revision integer NOT NULL DEFAULT 0`,
+    `ALTER TABLE analytics_rollup_state
+      ADD COLUMN IF NOT EXISTS revenue_cursor date`,
   ];
   for (const statement of statements) {
     await db.unsafe(statement);
@@ -154,11 +162,35 @@ function emptyAggregate(): DailyAggregate {
   };
 }
 
+function sqlDay(value: Date | string | null | undefined): string | null {
+  if (value == null) return null;
+  if (value instanceof Date) return utcDayString(value);
+  const text = String(value);
+  return text.length >= 10 ? text.slice(0, 10) : null;
+}
+
+function positiveFxRates(
+  rates: Record<string, number> | undefined,
+): Record<string, number> {
+  const fxRates: Record<string, number> = { USD: 1 };
+  for (const [code, rate] of Object.entries(rates ?? {})) {
+    if (typeof rate === "number" && Number.isFinite(rate) && rate > 0) {
+      fxRates[code.toUpperCase()] = rate;
+    }
+  }
+  return fxRates;
+}
+
 /** Replace one shop-day. Previous rows for that day are removed, then the latest totals are inserted. */
-export async function rebuildShopDay(shop: string, day: string): Promise<number> {
+export async function rebuildShopDay(
+  shop: string,
+  day: string,
+  rates?: Record<string, number>,
+): Promise<number> {
   await ensureAnalyticsDailyTable();
   const db = getAnalyticsSql();
   const end = addUtcDays(day, 1);
+  const fxRates = positiveFxRates(rates ?? (await getUsdFxRates()).rates);
 
   return db.begin(async (tx) => {
     await tx`select set_config('statement_timeout', '20000', true)`;
@@ -175,6 +207,9 @@ export async function rebuildShopDay(shop: string, day: string): Promise<number>
           and created_at < ${end}::timestamptz
           and length(coalesce(reference_id, '')) >= 12
           and coalesce(reference_id, '') !~ '^test'
+      ),
+      fx as (
+        select ${tx.json(fxRates)}::jsonb as rates
       ),
       base as (
         select
@@ -202,11 +237,20 @@ export async function rebuildShopDay(shop: string, day: string): Promise<number>
           select distinct on (reference_id)
             test_id,
             case
-              when coalesce(event_data->>'amountUsd', '') ~ '^[0-9]+(\\.[0-9]+)?$'
-                then (event_data->>'amountUsd')::numeric
-              when upper(coalesce(event_data->>'currency', 'USD')) = 'USD'
-               and coalesce(event_data->>'amount', '') ~ '^[0-9]+(\\.[0-9]+)?$'
-                then (event_data->>'amount')::numeric
+              when (regexp_match(btrim(coalesce(event_data->>'amountUsd', '')), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric > 0
+                then (regexp_match(btrim(event_data->>'amountUsd'), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric
+              when (regexp_match(btrim(coalesce(event_data->>'amount', '')), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric > 0
+               and upper(coalesce(nullif(btrim(event_data->>'currency'), ''), 'USD')) = 'USD'
+                then (regexp_match(btrim(event_data->>'amount'), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric
+              when (regexp_match(btrim(coalesce(event_data->>'amount', '')), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric > 0
+               and upper(btrim(coalesce(event_data->>'currency', ''))) <> ''
+               and upper(btrim(event_data->>'currency')) <> 'USD'
+               and (regexp_match(coalesce((select rates from fx) ->> upper(btrim(event_data->>'currency')), ''), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric > 0
+                then round(
+                  (regexp_match(btrim(event_data->>'amount'), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric
+                  / (regexp_match((select rates from fx) ->> upper(btrim(event_data->>'currency')), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric,
+                  2
+                )
               else 0
             end as amount_usd
           from real_events
@@ -396,17 +440,111 @@ async function missingPastDays(limit: number): Promise<Array<{ shop: string; day
   return missing;
 }
 
+async function saveRevenueCursor(
+  shop: string,
+  revision: number,
+  cursor: string | null,
+): Promise<void> {
+  const db = getAnalyticsSql();
+  await db`
+    insert into analytics_rollup_state (shop, revenue_revision, revenue_cursor)
+    values (${shop}, ${revision}, ${cursor}::date)
+    on conflict (shop) do update
+      set revenue_revision = excluded.revenue_revision,
+          revenue_cursor = excluded.revenue_cursor
+  `;
+}
+
+/**
+ * Past days were rolled up as $0 when the order currency was not USD.
+ * Rebuild those shop-days once. New events already store amountUsd.
+ */
+async function rewriteStoredNonUsdDays(
+  limit: number,
+  rates: Record<string, number>,
+): Promise<number> {
+  if (limit <= 0) return 0;
+  const db = getAnalyticsSql();
+  const yesterday = addUtcDays(utcDayString(), -1);
+  const shops = await db<
+    {
+      shop: string;
+      revenue_cursor: Date | string | null;
+      min_day: Date | string;
+    }[]
+  >`
+    select e.shop,
+           s.revenue_cursor,
+           min(e.created_at) as min_day
+    from analytics_events e
+    left join analytics_rollup_state s on s.shop = e.shop
+    where coalesce(s.revenue_revision, 0) < ${REVENUE_ROLLUP_REVISION}
+      and e.event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
+      and length(coalesce(e.reference_id, '')) >= 12
+      and coalesce(e.reference_id, '') !~ '^test'
+      and upper(coalesce(nullif(btrim(e.event_data->>'currency'), ''), 'USD')) <> 'USD'
+      and (regexp_match(btrim(coalesce(e.event_data->>'amount', '')), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric > 0
+      and coalesce(
+        (regexp_match(btrim(coalesce(e.event_data->>'amountUsd', '')), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric,
+        0
+      ) <= 0
+    group by e.shop, s.revenue_cursor
+    limit 20
+  `;
+
+  let rebuilt = 0;
+  for (const row of shops) {
+    if (rebuilt >= limit) break;
+    const minDay = sqlDay(row.min_day);
+    if (!minDay) continue;
+
+    let cursor = sqlDay(row.revenue_cursor) ?? yesterday;
+    if (cursor > yesterday) cursor = yesterday;
+    if (cursor < minDay) {
+      await saveRevenueCursor(row.shop, REVENUE_ROLLUP_REVISION, null);
+      continue;
+    }
+
+    while (cursor >= minDay && rebuilt < limit) {
+      try {
+        await rebuildShopDay(row.shop, cursor, rates);
+      } catch (error) {
+        console.error("[analytics-rollup] revenue rewrite failed", {
+          shop: row.shop,
+          day: cursor,
+          error,
+        });
+        await saveRevenueCursor(row.shop, 0, cursor);
+        break;
+      }
+
+      rebuilt += 1;
+      cursor = addUtcDays(cursor, -1);
+      const done = cursor < minDay;
+      await saveRevenueCursor(
+        row.shop,
+        done ? REVENUE_ROLLUP_REVISION : 0,
+        done ? null : cursor,
+      );
+      if (done) break;
+    }
+  }
+
+  return rebuilt;
+}
+
 /**
  * Hourly copy.
- * Today is the only day removed and written again, so that day's rows stay
- * current without duplicates. Past days that already have rows are left as
- * they are. A past day is inserted once, only when it has no row yet.
+ * Today is removed and written again. Past days that were stored before
+ * non-USD totals were converted are rebuilt until revenue_revision matches.
+ * Other past days are inserted once, only when that day has no row yet.
  * analytics_events is never deleted here.
  */
 export async function refreshHourlyAnalyticsRollup(): Promise<{
   today: string;
   rebuiltToday: number;
   backfilled: number;
+  rewrittenRevenueDays: number;
 }> {
   await ensureAnalyticsDailyTable();
   const redis = getRedis();
@@ -420,20 +558,36 @@ export async function refreshHourlyAnalyticsRollup(): Promise<{
     }
   }
   if (locked !== "OK") {
-    return { today: utcDayString(), rebuiltToday: 0, backfilled: 0 };
+    return {
+      today: utcDayString(),
+      rebuiltToday: 0,
+      backfilled: 0,
+      rewrittenRevenueDays: 0,
+    };
   }
 
   try {
     const today = utcDayString();
+    const rates = positiveFxRates((await getUsdFxRates()).rates);
     const shops = await shopsForToday(today);
     let rebuiltToday = 0;
     for (const shop of shops) {
       try {
-        await rebuildShopDay(shop, today);
+        await rebuildShopDay(shop, today, rates);
         rebuiltToday += 1;
       } catch (error) {
         console.error("[analytics-rollup] today rebuild failed", { shop, error });
       }
+    }
+
+    let rewrittenRevenueDays = 0;
+    try {
+      rewrittenRevenueDays = await rewriteStoredNonUsdDays(
+        REWRITE_DAYS_PER_RUN,
+        rates,
+      );
+    } catch (error) {
+      console.error("[analytics-rollup] revenue rewrite lookup failed", error);
     }
 
     let backfilled = 0;
@@ -455,7 +609,7 @@ export async function refreshHourlyAnalyticsRollup(): Promise<{
             attempts.set(row.shop, list);
             continue;
           }
-          await rebuildShopDay(row.shop, row.day);
+          await rebuildShopDay(row.shop, row.day, rates);
           backfilled += 1;
           list.push({ day: row.day, ok: true });
         } catch (error) {
@@ -482,7 +636,7 @@ export async function refreshHourlyAnalyticsRollup(): Promise<{
       console.error("[analytics-rollup] missing-day lookup failed", error);
     }
 
-    return { today, rebuiltToday, backfilled };
+    return { today, rebuiltToday, backfilled, rewrittenRevenueDays };
   } finally {
     if (redis) {
       try {

@@ -29,6 +29,38 @@ const sql = postgres(databaseUrl(), {
   connect_timeout: 30,
 });
 
+const FALLBACK_RATES = {
+  USD: 1,
+  GBP: 0.79,
+  EUR: 0.92,
+  AUD: 1.55,
+  CAD: 1.36,
+  NZD: 1.68,
+  JPY: 150,
+  INR: 83,
+  SGD: 1.34,
+  HKD: 7.8,
+  CHF: 0.88,
+  AED: 3.67,
+};
+
+async function loadFxRates() {
+  try {
+    const symbols = Object.keys(FALLBACK_RATES)
+      .filter((code) => code !== "USD")
+      .join(",");
+    const response = await fetch(
+      `https://api.frankfurter.app/latest?from=USD&to=${symbols}`,
+    );
+    if (!response.ok) throw new Error(`FX API ${response.status}`);
+    const payload = await response.json();
+    return { ...FALLBACK_RATES, USD: 1, ...(payload.rates ?? {}) };
+  } catch (error) {
+    console.warn("FX fetch failed, using fallback rates", error);
+    return { ...FALLBACK_RATES };
+  }
+}
+
 async function ensureTables() {
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS analytics_daily (
@@ -63,9 +95,17 @@ async function ensureTables() {
       oldest_filled date
     )
   `);
+  await sql.unsafe(`
+    ALTER TABLE analytics_rollup_state
+      ADD COLUMN IF NOT EXISTS revenue_revision integer NOT NULL DEFAULT 0
+  `);
+  await sql.unsafe(`
+    ALTER TABLE analytics_rollup_state
+      ADD COLUMN IF NOT EXISTS revenue_cursor date
+  `);
 }
 
-async function rebuildShopDay(shop, day) {
+async function rebuildShopDay(shop, day, rates) {
   const end = addUtcDays(day, 1);
   return sql.begin(async (tx) => {
     await tx`select set_config('statement_timeout', '60000', true)`;
@@ -82,6 +122,9 @@ async function rebuildShopDay(shop, day) {
           and created_at < ${end}::timestamptz
           and length(coalesce(reference_id, '')) >= 12
           and coalesce(reference_id, '') !~ '^test'
+      ),
+      fx as (
+        select ${tx.json(rates)}::jsonb as rates
       ),
       base as (
         select
@@ -109,11 +152,20 @@ async function rebuildShopDay(shop, day) {
           select distinct on (reference_id)
             test_id,
             case
-              when coalesce(event_data->>'amountUsd', '') ~ '^[0-9]+(\\.[0-9]+)?$'
-                then (event_data->>'amountUsd')::numeric
-              when upper(coalesce(event_data->>'currency', 'USD')) = 'USD'
-               and coalesce(event_data->>'amount', '') ~ '^[0-9]+(\\.[0-9]+)?$'
-                then (event_data->>'amount')::numeric
+              when (regexp_match(btrim(coalesce(event_data->>'amountUsd', '')), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric > 0
+                then (regexp_match(btrim(event_data->>'amountUsd'), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric
+              when (regexp_match(btrim(coalesce(event_data->>'amount', '')), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric > 0
+               and upper(coalesce(nullif(btrim(event_data->>'currency'), ''), 'USD')) = 'USD'
+                then (regexp_match(btrim(event_data->>'amount'), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric
+              when (regexp_match(btrim(coalesce(event_data->>'amount', '')), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric > 0
+               and upper(btrim(coalesce(event_data->>'currency', ''))) <> ''
+               and upper(btrim(event_data->>'currency')) <> 'USD'
+               and (regexp_match(coalesce((select rates from fx) ->> upper(btrim(event_data->>'currency')), ''), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric > 0
+                then round(
+                  (regexp_match(btrim(event_data->>'amount'), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric
+                  / (regexp_match((select rates from fx) ->> upper(btrim(event_data->>'currency')), '^([0-9]+\\.[0-9]+|[0-9]+)$'))[1]::numeric,
+                  2
+                )
               else 0
             end as amount_usd
           from real_events
@@ -210,6 +262,7 @@ async function rebuildShopDay(shop, day) {
 
 async function main() {
   await ensureTables();
+  const rates = await loadFxRates();
   await sql`select set_config('statement_timeout', '120000', false)`;
 
   const pairs = await sql`
@@ -223,7 +276,7 @@ async function main() {
   let done = 0;
   for (const row of pairs) {
     const day = dayString(row.day);
-    const count = await rebuildShopDay(row.shop, day);
+    const count = await rebuildShopDay(row.shop, day, rates);
     done += 1;
     if (done === 1 || done % 10 === 0 || done === pairs.length) {
       console.log(`rebuilt ${done}/${pairs.length} ${row.shop} ${day} rows=${count}`);
@@ -265,12 +318,14 @@ async function main() {
   `;
 
   await sql`
-    insert into analytics_rollup_state (shop, oldest_filled)
-    select shop, min(day)
+    insert into analytics_rollup_state (shop, oldest_filled, revenue_revision, revenue_cursor)
+    select shop, min(day), 2, null
     from analytics_daily
     group by shop
     on conflict (shop) do update
-      set oldest_filled = least(analytics_rollup_state.oldest_filled, excluded.oldest_filled)
+      set oldest_filled = least(analytics_rollup_state.oldest_filled, excluded.oldest_filled),
+          revenue_revision = 2,
+          revenue_cursor = null
   `;
 
   console.log("\nDAILY TABLE TOTALS");

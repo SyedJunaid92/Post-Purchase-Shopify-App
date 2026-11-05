@@ -1,3 +1,6 @@
+import { convertToUsd } from "./analytics.format";
+import { getUsdFxRates } from "./fx.server";
+import { getShopCurrencyCode } from "./shop-currency.server";
 import type {
   ComboTestConfig,
   ProductFields,
@@ -56,11 +59,35 @@ function parseEventAmount(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function hasPositiveStoredAmount(eventData: Record<string, unknown>): boolean {
-  const amount = parseEventAmount(eventData.amount);
-  if (amount != null && amount > 0) return true;
+function readCurrency(eventData: Record<string, unknown>): string | null {
+  if (typeof eventData.currency !== "string") return null;
+  const code = eventData.currency.trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(code) ? code : null;
+}
+
+function hasReportableUsd(eventData: Record<string, unknown>): boolean {
   const amountUsd = parseEventAmount(eventData.amountUsd);
-  return amountUsd != null && amountUsd > 0;
+  if (amountUsd != null && amountUsd > 0) return true;
+  const amount = parseEventAmount(eventData.amount);
+  if (amount == null || amount <= 0) return false;
+  return (readCurrency(eventData) ?? "USD") === "USD";
+}
+
+async function usdString(
+  amount: number,
+  currency: string,
+): Promise<string | null> {
+  const code = currency.trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(code)) return null;
+  if (code === "USD") return amount.toFixed(2);
+  try {
+    const fx = await getUsdFxRates();
+    const usd = convertToUsd(amount, code, fx.rates);
+    if (!Number.isFinite(usd) || usd <= 0) return null;
+    return usd.toFixed(2);
+  } catch {
+    return null;
+  }
 }
 
 export function conversionRowFromEventData(
@@ -84,9 +111,7 @@ export function conversionRowFromEventData(
   };
 }
 
-function priceFromProductFields(
-  product: ProductFields,
-): { amount: string; amountUsd: string; currency: string } | null {
+function catalogAmount(product: ProductFields): number | null {
   const base = product.productPrice;
   if (!base) return null;
 
@@ -96,9 +121,7 @@ function priceFromProductFields(
   const discount = product.discountPercentage ?? 0;
   const final = discount > 0 ? price * (1 - discount / 100) : price;
   if (!Number.isFinite(final) || final <= 0) return null;
-
-  const amount = final.toFixed(2);
-  return { amount, amountUsd: amount, currency: "USD" };
+  return final;
 }
 
 function productFieldsForTest(
@@ -141,8 +164,16 @@ export async function enrichConversionEventData(
   const data = { ...(event.eventData ?? {}) };
   if (!CONVERSION_EVENTS.has(event.eventType)) return data;
 
-  const existing = parseEventAmount(data.amount);
-  if (existing != null && existing > 0) return data;
+  const storedUsd = parseEventAmount(data.amountUsd);
+  if (storedUsd != null && storedUsd > 0) return data;
+
+  const amount = parseEventAmount(data.amount);
+  if (amount != null && amount > 0) {
+    const currency = readCurrency(data) ?? "USD";
+    const amountUsd = await usdString(amount, currency);
+    if (!amountUsd) return data;
+    return { ...data, currency, amountUsd };
+  }
 
   if (!event.testId) return data;
 
@@ -155,23 +186,20 @@ export async function enrichConversionEventData(
       test.config,
       data.comboVariant,
     );
-    const priced = product ? priceFromProductFields(product) : null;
-    if (!priced) return data;
+    const price = product ? catalogAmount(product) : null;
+    if (price == null || !product) return data;
 
-    const isSubscription = Boolean(product?.sellingPlanLegacyId);
+    const currency = await getShopCurrencyCode(event.shop);
+    if (!currency) return data;
+
+    const amountUsd = await usdString(price, currency);
+    const isSubscription = Boolean(product.sellingPlanLegacyId);
 
     return {
       ...data,
-      amount: priced.amount,
-      currency:
-        typeof data.currency === "string" && data.currency.trim()
-          ? data.currency
-          : priced.currency,
-      amountUsd:
-        parseEventAmount(data.amountUsd) != null &&
-        parseEventAmount(data.amountUsd)! > 0
-          ? String(data.amountUsd)
-          : priced.amountUsd,
+      amount: price.toFixed(2),
+      currency,
+      ...(amountUsd ? { amountUsd } : {}),
       ...(isSubscription
         ? {
             revenueBasis:
@@ -199,7 +227,7 @@ export async function resolveConversionOrderRow(
 ): Promise<ConversionOrderRow> {
   const eventData = normalizeEventData(row.event_data);
 
-  if (hasPositiveStoredAmount(eventData)) {
+  if (hasReportableUsd(eventData)) {
     return conversionRowFromEventData(
       row.reference_id,
       row.test_id,

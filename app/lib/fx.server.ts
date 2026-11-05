@@ -61,7 +61,10 @@ export async function getUsdFxRates(): Promise<FxSnapshot> {
     const data: FxSnapshot = {
       base: REPORTING_CURRENCY,
       asOf: payload.date ?? new Date().toISOString().slice(0, 10),
-      rates: normalizeRates(payload.rates ?? {}),
+      rates: normalizeRates({
+        ...FALLBACK_RATES,
+        ...(payload.rates ?? {}),
+      }),
     };
 
     cachedFx = { at: Date.now(), data };

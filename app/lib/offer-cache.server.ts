@@ -9,6 +9,7 @@ import {
   REDIS_KEYS,
   REDIS_TTL,
 } from "./redis.server";
+import { getShopCurrencyCode } from "./shop-currency.server";
 import { getActiveTest, type Test } from "./tests.server";
 
 type CacheEntry = {
@@ -64,7 +65,33 @@ export async function getOfferPayloadForShop(
     if (!shouldShowFunnelForPurchase(test.triggers, lineItems)) return null;
   }
 
-  return buildFlowFromTest(test, referenceId);
+  const payload = buildFlowFromTest(test, referenceId);
+  if (!payload) return null;
+
+  const priceCurrency = await shopCurrencyForOffer(shop);
+  if (!priceCurrency) return payload;
+
+  return {
+    ...payload,
+    offers: payload.offers.map((offer) => ({
+      ...offer,
+      priceCurrency,
+    })),
+  };
+}
+
+async function shopCurrencyForOffer(shop: string): Promise<string | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      getShopCurrencyCode(shop),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), 1200);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export function invalidateOfferCache(shop: string): void {

@@ -152,7 +152,8 @@ alter table analytics_events enable row level security;
 alter table post_purchase_events enable row level security;
 
 -- Daily totals. Analytics pages read this table. The hourly cron rewrites the
--- current UTC day (delete, then insert) and only inserts older days that are missing.
+-- current UTC day, rebuilds past days whose non-USD revenue was stored as $0,
+-- and inserts any other older day that is still missing.
 create table if not exists analytics_daily (
   shop text not null,
   day date not null,
@@ -180,8 +181,15 @@ create index if not exists analytics_daily_shop_day_idx
 
 create table if not exists analytics_rollup_state (
   shop text primary key,
-  oldest_filled date
+  oldest_filled date,
+  revenue_revision integer not null default 0,
+  revenue_cursor date
 );
+
+alter table analytics_rollup_state
+  add column if not exists revenue_revision integer not null default 0;
+alter table analytics_rollup_state
+  add column if not exists revenue_cursor date;
 
 alter table analytics_daily enable row level security;
 alter table analytics_rollup_state enable row level security;
