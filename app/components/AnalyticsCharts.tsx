@@ -15,17 +15,32 @@ const BAR_COLORS: Record<NonNullable<BarItem["tone"]>, string> = {
   neutral: "#8c9196",
 };
 
+function formatRawChartValue(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  if (Number.isInteger(value)) return String(value);
+  return value.toFixed(2);
+}
+
+/** Shrink the donut headline so it stays inside the ring. */
+function fitCenterFontSize(value: string, innerDiameter: number): number {
+  const available = Math.max(40, innerDiameter - 12);
+  const estimated = available / (Math.max(value.length, 1) * 0.72);
+  return Math.round(Math.max(12, Math.min(28, estimated)));
+}
+
 export function HorizontalBarChart({
   title,
   items,
   emptyMessage = "No data yet",
   baseline,
+  formatValue,
 }: {
   title: string;
   items: BarItem[];
   emptyMessage?: string;
   /** When set, percentages are shown as % of baseline (e.g. shown orders). */
   baseline?: number;
+  formatValue?: (value: number) => string;
 }) {
   const max = Math.max(...items.map((i) => i.value), 1);
   const total = items.reduce((sum, i) => sum + i.value, 0);
@@ -62,7 +77,9 @@ export function HorizontalBarChart({
                 <s-box inlineSize="140px">
                   <s-text>{item.label}</s-text>
                 </s-box>
-                <s-text type="strong">{item.value}</s-text>
+                <s-text type="strong">
+                  {formatValue ? formatValue(item.value) : formatRawChartValue(item.value)}
+                </s-text>
                 <s-text tone="neutral" color="subdued">
                   ({pct}%)
                 </s-text>
@@ -107,6 +124,7 @@ export function DonutChart({
   centerLabel,
   emptyMessage = "No data yet",
   size = 168,
+  formatValue,
 }: {
   title: string;
   segments: DonutSegment[];
@@ -114,11 +132,14 @@ export function DonutChart({
   centerLabel?: string;
   emptyMessage?: string;
   size?: number;
+  formatValue?: (value: number) => string;
 }) {
   const total = segments.reduce((sum, s) => sum + s.value, 0);
-  const stroke = Math.round(size * 0.16);
+  const stroke = Math.round(size * 0.12);
   const radius = (size - stroke) / 2;
   const circumference = 2 * Math.PI * radius;
+  const innerDiameter = size - stroke * 2;
+  const centerFontSize = fitCenterFontSize(centerValue, innerDiameter);
 
   let offset = 0;
   const arcs =
@@ -150,60 +171,75 @@ export function DonutChart({
           </s-text>
         ) : (
           <s-stack direction="inline" gap="large" alignItems="center">
-            <svg
-              width={size}
-              height={size}
-              viewBox={`0 0 ${size} ${size}`}
-              role="img"
-              aria-label={title}
-              style={{ flexShrink: 0 }}
-            >
-              <g transform={`rotate(-90 ${size / 2} ${size / 2})`}>
-                <circle
-                  cx={size / 2}
-                  cy={size / 2}
-                  r={radius}
-                  fill="none"
-                  stroke="var(--p-color-bg-surface-secondary, #f1f1f1)"
-                  strokeWidth={stroke}
-                />
-                {arcs.map((arc) => (
+            <div style={{ position: "relative", width: size, height: size, flexShrink: 0 }}>
+              <svg
+                width={size}
+                height={size}
+                viewBox={`0 0 ${size} ${size}`}
+                role="img"
+                aria-label={title}
+              >
+                <g transform={`rotate(-90 ${size / 2} ${size / 2})`}>
                   <circle
-                    key={arc.label}
                     cx={size / 2}
                     cy={size / 2}
                     r={radius}
                     fill="none"
-                    stroke={arc.color}
+                    stroke="var(--p-color-bg-surface-secondary, #f1f1f1)"
                     strokeWidth={stroke}
-                    strokeDasharray={`${arc.dash} ${arc.gap}`}
-                    strokeDashoffset={-arc.offset}
-                    strokeLinecap="butt"
-                    style={{ transition: "stroke-dasharray 0.5s ease" }}
                   />
-                ))}
-              </g>
-              <text
-                x="50%"
-                y="47%"
-                textAnchor="middle"
-                dominantBaseline="middle"
-                style={{ fontSize: size * 0.2, fontWeight: 700, fill: "#202223" }}
+                  {arcs.map((arc) => (
+                    <circle
+                      key={arc.label}
+                      cx={size / 2}
+                      cy={size / 2}
+                      r={radius}
+                      fill="none"
+                      stroke={arc.color}
+                      strokeWidth={stroke}
+                      strokeDasharray={`${arc.dash} ${arc.gap}`}
+                      strokeDashoffset={-arc.offset}
+                      strokeLinecap="butt"
+                      style={{ transition: "stroke-dasharray 0.5s ease" }}
+                    />
+                  ))}
+                </g>
+              </svg>
+              <div
+                style={{
+                  position: "absolute",
+                  left: stroke,
+                  top: stroke,
+                  width: innerDiameter,
+                  height: innerDiameter,
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  textAlign: "center",
+                  pointerEvents: "none",
+                  overflow: "hidden",
+                }}
               >
-                {centerValue}
-              </text>
-              {centerLabel ? (
-                <text
-                  x="50%"
-                  y="61%"
-                  textAnchor="middle"
-                  dominantBaseline="middle"
-                  style={{ fontSize: size * 0.08, fill: "#6d7175" }}
+                <span
+                  style={{
+                    fontSize: centerFontSize,
+                    fontWeight: 700,
+                    lineHeight: 1.1,
+                    color: "#202223",
+                    maxWidth: "100%",
+                    whiteSpace: "nowrap",
+                  }}
                 >
-                  {centerLabel}
-                </text>
-              ) : null}
-            </svg>
+                  {centerValue}
+                </span>
+                {centerLabel ? (
+                  <span style={{ fontSize: 12, lineHeight: 1.2, color: "#6d7175" }}>
+                    {centerLabel}
+                  </span>
+                ) : null}
+              </div>
+            </div>
             <s-stack direction="block" gap="small">
               {segments.map((s) => (
                 <s-stack
@@ -224,7 +260,9 @@ export function DonutChart({
                     }}
                   />
                   <s-text>{s.label}</s-text>
-                  <s-text type="strong">{s.value}</s-text>
+                  <s-text type="strong">
+                    {formatValue ? formatValue(s.value) : formatRawChartValue(s.value)}
+                  </s-text>
                   <s-text tone="neutral" color="subdued">
                     ({total > 0 ? Math.round((s.value / total) * 100) : 0}%)
                   </s-text>
@@ -634,6 +672,7 @@ export function RevenueMetricsPanel({
       {totalShown > 0 && (revenuePerVisitor > 0 || averageOrderValue > 0) ? (
         <HorizontalBarChart
           title="Revenue per visitor vs. avg. order value"
+          formatValue={(value) => formatMoney(value, displayCurrency)}
           items={[
             {
               label: `RPV (${formatDisplay(revenuePerVisitor)})`,
@@ -899,6 +938,7 @@ export function RevenueAnalyticsVisuals({
           centerValue={formatDisplay(totalRevenue)}
           centerLabel="total"
           emptyMessage="Complete a checkout to see revenue split"
+          formatValue={(value) => formatDisplay(value)}
           segments={funnelSegments}
         />
       </s-grid>
