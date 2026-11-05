@@ -1,0 +1,5 @@
+name = "post-purchase-offer"
+type = "checkout_post_purchase"
+handle = "post-purchase-offer"
+uid = "a8f3c2e1-4b5d-4a9e-8f7c-1d2e3f4a5b6c"
+api_version = "2026-04"

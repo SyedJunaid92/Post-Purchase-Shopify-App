@@ -1,0 +1,35 @@
+# This file stores configurations for your Shopify app.
+name = "Post-Purchase App"
+client_id = "7c74be995b91a95289e2510d0867669e"
+application_url = "https://post-purchase-app-five.vercel.app"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+
+[access_scopes]
+# Managed install: scopes are declared here so Shopify handles install/scope updates
+# without OAuth redirects (pairs with token exchange in shopify.server.ts).
+scopes = "write_products,read_products,read_orders"
+
+[auth]
+redirect_urls = [ "https://post-purchase-app-five.vercel.app/auth/callback" ]
+
+[webhooks]
+api_version = "2026-04"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = ["app/uninstalled"]
+
+  [[webhooks.subscriptions]]
+  topics = ["app/scopes_update"]
+  uri = "/webhooks/app/scopes_update"
+
+  [[webhooks.subscriptions]]
+  topics = ["app_subscriptions/update"]
+  uri = "/webhooks/app/subscriptions_update"
+
+  [[webhooks.subscriptions]]
+  compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+  uri = "/webhooks/compliance"

@@ -1,0 +1,141 @@
+.index {
+  align-items: center;
+  display: flex;
+  justify-content: center;
+  min-height: 100vh;
+  width: 100%;
+  text-align: center;
+  padding: 2rem 1rem;
+  background: linear-gradient(180deg, #f6fbf9 0%, #ffffff 40%);
+  color: #202223;
+  font-family: Inter, system-ui, sans-serif;
+}
+
+.content {
+  display: grid;
+  gap: 1.5rem;
+  max-width: 42rem;
+}
+
+.eyebrow {
+  margin: 0;
+  font-size: 0.875rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #008060;
+}
+
+.heading,
+.text {
+  padding: 0;
+  margin: 0;
+}
+
+.heading {
+  font-size: clamp(2rem, 5vw, 2.75rem);
+  line-height: 1.1;
+}
+
+.text {
+  font-size: 1.125rem;
+  line-height: 1.6;
+  color: #616161;
+}
+
+.form {
+  display: flex;
+  align-items: end;
+  justify-content: center;
+  margin: 0 auto;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.installNotice {
+  padding: 1rem 1.1rem;
+  border: 1px solid #b4e0d1;
+  border-radius: 12px;
+  background: #f1f8f5;
+  text-align: left;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.installNotice p {
+  margin: 0;
+  color: #616161;
+  line-height: 1.5;
+}
+
+.label {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 16rem;
+  text-align: left;
+  font-size: 0.95rem;
+}
+
+.input {
+  padding: 0.65rem 0.75rem;
+  border: 1px solid #c9cccf;
+  border-radius: 8px;
+  font-size: 1rem;
+}
+
+.button {
+  padding: 0.7rem 1.25rem;
+  border: none;
+  border-radius: 8px;
+  background: #008060;
+  color: #ffffff;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.button:hover {
+  background: #006e52;
+}
+
+.list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 1rem;
+  text-align: left;
+}
+
+.list > li {
+  padding: 1rem 1.1rem;
+  border: 1px solid #e1e3e5;
+  border-radius: 12px;
+  background: #ffffff;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.list strong {
+  font-size: 1rem;
+}
+
+.list span {
+  color: #616161;
+  line-height: 1.5;
+}
+
+.footer {
+  margin: 0;
+  font-size: 0.95rem;
+  color: #616161;
+}
+
+.footer a {
+  color: #008060;
+  text-decoration: none;
+}
+
+.footer a:hover {
+  text-decoration: underline;
+}

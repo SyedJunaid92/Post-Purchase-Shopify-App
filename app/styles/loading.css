@@ -1,0 +1,185 @@
+/* ── Shared easing ── */
+:root {
+  --pp-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --pp-ease-soft: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ── Top progress bar (route transitions) ── */
+.pp-top-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 10001;
+  height: 2px;
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 280ms var(--pp-ease-soft);
+}
+
+.pp-top-progress--complete {
+  opacity: 0;
+}
+
+.pp-top-progress__track {
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 128, 96, 0.08);
+  overflow: hidden;
+}
+
+.pp-top-progress__bar {
+  height: 100%;
+  width: 40%;
+  border-radius: 0 2px 2px 0;
+  background: linear-gradient(
+    90deg,
+    rgba(0, 128, 96, 0.35) 0%,
+    #008060 50%,
+    rgba(0, 128, 96, 0.35) 100%
+  );
+  transform: translate3d(-105%, 0, 0);
+  animation: ppTopBarSlide 1.1s var(--pp-ease-soft) infinite;
+  will-change: transform;
+}
+
+.pp-top-progress--complete .pp-top-progress__bar {
+  animation: none;
+  width: 100%;
+  transform: translate3d(0, 0, 0);
+  transition: transform 280ms var(--pp-ease-out), width 280ms var(--pp-ease-out);
+  background: #008060;
+}
+
+@keyframes ppTopBarSlide {
+  0% {
+    transform: translate3d(-105%, 0, 0);
+  }
+  100% {
+    transform: translate3d(280%, 0, 0);
+  }
+}
+
+/* ── Animated logo (inline / skeleton use only) ── */
+.pp-animated-logo {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.pp-animated-logo__stage {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pp-animated-logo__halo {
+  position: absolute;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    rgba(0, 128, 96, 0.14) 0%,
+    rgba(0, 128, 96, 0) 70%
+  );
+  animation: ppLogoHalo 2.8s ease-in-out infinite;
+}
+
+.pp-animated-logo__ring {
+  position: absolute;
+  border-radius: 30%;
+  border: 2px solid rgba(0, 128, 96, 0.08);
+  border-top-color: rgba(0, 128, 96, 0.5);
+  animation: ppLogoSpin 1.6s linear infinite;
+}
+
+.pp-animated-logo__mark {
+  position: relative;
+  z-index: 1;
+  border-radius: 24%;
+  box-shadow: 0 4px 16px rgba(0, 128, 96, 0.14);
+  display: block;
+  animation: ppLogoBreathe 2.8s ease-in-out infinite;
+}
+
+.pp-animated-logo__label {
+  font-size: 13px;
+  font-weight: 500;
+  color: #6d7175;
+  letter-spacing: 0.01em;
+}
+
+@keyframes ppLogoBreathe {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  50% {
+    transform: translate3d(0, -2px, 0);
+  }
+}
+
+@keyframes ppLogoHalo {
+  0%,
+  100% {
+    transform: scale(0.96);
+    opacity: 0.4;
+  }
+  50% {
+    transform: scale(1.04);
+    opacity: 0.75;
+  }
+}
+
+@keyframes ppLogoSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── Inline loading placeholder ── */
+.pp-inline-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: 32px 16px;
+}
+
+/* ── Skeleton shimmer ── */
+.pp-skeleton {
+  background: linear-gradient(
+    110deg,
+    #f4f5f6 0%,
+    #f4f5f6 40%,
+    #eceef0 50%,
+    #f4f5f6 60%,
+    #f4f5f6 100%
+  );
+  background-size: 200% 100%;
+  animation: ppSkeletonShimmer 1.6s ease-in-out infinite;
+}
+
+@keyframes ppSkeletonShimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pp-top-progress__bar,
+  .pp-animated-logo__halo,
+  .pp-animated-logo__ring,
+  .pp-animated-logo__mark,
+  .pp-skeleton {
+    animation: none !important;
+  }
+
+  .pp-top-progress--complete .pp-top-progress__bar {
+    transition: none;
+  }
+}
