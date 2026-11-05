@@ -151,4 +151,39 @@ alter table analytics_events enable row level security;
 
 alter table post_purchase_events enable row level security;
 
+-- Daily totals. Analytics pages read this table. The hourly cron rewrites the
+-- current UTC day (delete, then insert) and only inserts older days that are missing.
+create table if not exists analytics_daily (
+  shop text not null,
+  day date not null,
+  test_key text not null,
+  test_id uuid,
+  shown integer not null default 0,
+  qualified integer not null default 0,
+  rejected integer not null default 0,
+  accepted integer not null default 0,
+  declined integer not null default 0,
+  auto_added integer not null default 0,
+  completed integer not null default 0,
+  api_checks integer not null default 0,
+  revenue_usd numeric(14,2) not null default 0,
+  orders_with_revenue integer not null default 0,
+  combo_split jsonb not null default '[]'::jsonb,
+  funnel_steps jsonb not null default '[]'::jsonb,
+  funnel_types jsonb not null default '[]'::jsonb,
+  updated_at timestamptz not null default now(),
+  primary key (shop, day, test_key)
+);
+
+create index if not exists analytics_daily_shop_day_idx
+  on analytics_daily (shop, day desc);
+
+create table if not exists analytics_rollup_state (
+  shop text primary key,
+  oldest_filled date
+);
+
+alter table analytics_daily enable row level security;
+alter table analytics_rollup_state enable row level security;
+
 -- Service role bypasses RLS; no public policies needed for server-side access.

@@ -3,13 +3,8 @@ import {
   computeAverageOrderValue,
   computeRevenuePerVisitor,
 } from "./analytics.format";
-import {
-  buildRevenueStats,
-  mapConversionOrderRows,
-  summarizeRevenueByTest,
-  type RevenueStats,
-} from "./analytics.revenue.server";
-import { enrichConversionEventData, resolveConversionOrderRow } from "./analytics.conversion.server";
+import { type RevenueStats } from "./analytics.revenue.server";
+import { enrichConversionEventData } from "./analytics.conversion.server";
 import { getUsdFxRates } from "./fx.server";
 import { REPORTING_CURRENCY, type FxSnapshot } from "./fx.constants";
 import { cacheGet, cacheSet, REDIS_KEYS, REDIS_TTL } from "./redis.server";
@@ -126,81 +121,53 @@ export function getAnalyticsSql() {
   return getSql();
 }
 
-const REAL_CHECKOUT_FILTER = `length(coalesce(reference_id, '')) >= 12 and coalesce(reference_id, '') !~ '^test'`;
 
-async function fetchConversionOrderRows(
+async function readDaily(
   shop: string,
-  testId?: string,
-): Promise<
-  Array<{
-    reference_id: string;
-    test_id: string | null;
-    amount: string | null;
-    currency: string | null;
-    amount_usd: string | null;
-  }>
-> {
-  const db = getSql();
+  scope: { since?: Date | null; testIds?: string[] | null; testId?: string } = {},
+) {
+  const { readAnalyticsDaily } = await import("./analytics-daily.server");
+  return readAnalyticsDaily(shop, {
+    since: scope.since ?? null,
+    testIds: scope.testId
+      ? [scope.testId]
+      : scope.testIds === undefined
+        ? null
+        : scope.testIds,
+  });
+}
 
-  const rows = testId
-    ? await db<
-        {
-          reference_id: string;
-          test_id: string | null;
-          event_type: string;
-          event_data: unknown;
-        }[]
-      >`
-        select distinct on (reference_id)
-          reference_id,
-          test_id,
-          event_type,
-          event_data
-        from analytics_events
-        where shop = ${shop}
-          and test_id = ${testId}
-          and event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        order by reference_id, created_at desc
-      `
-    : await db<
-        {
-          reference_id: string;
-          test_id: string | null;
-          event_type: string;
-          event_data: unknown;
-        }[]
-      >`
-        select distinct on (reference_id)
-          reference_id,
-          test_id,
-          event_type,
-          event_data
-        from analytics_events
-        where shop = ${shop}
-          and event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        order by reference_id, created_at desc
-      `;
+function dashboardStatsFromDaily(
+  row: Awaited<ReturnType<typeof readDaily>>,
+): DashboardStats {
+  return {
+    totalShown: row.shown,
+    totalQualified: row.qualified,
+    totalRejected: row.rejected,
+    totalAccepted: row.accepted,
+    totalDeclined: row.declined,
+    totalAutoAdded: row.autoAdded,
+    totalCompleted: row.completed,
+    totalApiChecks: row.apiChecks,
+  };
+}
 
-  try {
-    return await Promise.all(
-      rows.map((row) => resolveConversionOrderRow(shop, row)),
-    );
-  } catch (error) {
-    console.error("fetchConversionOrderRows failed:", error);
-    return [];
-  }
+function revenueFromDaily(
+  row: Awaited<ReturnType<typeof readDaily>>,
+): RevenueStats {
+  return {
+    totalRevenue: row.revenueUsd,
+    ordersWithRevenue: row.ordersWithRevenue,
+    currency: REPORTING_CURRENCY,
+    fxAsOf: new Date().toISOString().slice(0, 10),
+  };
 }
 
 export async function getRevenueStats(
   shop: string,
   testId?: string,
 ): Promise<RevenueStats> {
-  const rows = mapConversionOrderRows(await fetchConversionOrderRows(shop, testId));
-  return buildRevenueStats(rows);
+  return revenueFromDaily(await readDaily(shop, { testId }));
 }
 
 function attachRevenueMetrics<T extends { totalShown: number }>(
@@ -234,6 +201,10 @@ function attachRevenueMetrics<T extends { totalShown: number }>(
 export async function deleteAnalyticsForShop(shop: string): Promise<void> {
   const db = getSql();
   await db`delete from analytics_events where shop = ${shop}`;
+  const { deleteAnalyticsDailyForShop } = await import("./analytics-daily.server");
+  await deleteAnalyticsDailyForShop(shop).catch((error) => {
+    console.error("deleteAnalyticsDailyForShop:", error);
+  });
 }
 
 export async function logAnalyticsEvent(event: AnalyticsEvent): Promise<void> {
@@ -259,183 +230,28 @@ export async function logAnalyticsEvent(event: AnalyticsEvent): Promise<void> {
   `;
 }
 
-type StatsRow = {
-  total_shown: string;
-  total_qualified: string;
-  total_rejected: string;
-  total_accepted: string;
-  total_declined: string;
-  total_auto_added: string;
-  total_completed: string;
-  total_api_checks: string;
-};
-
-function mapStatsRow(row: StatsRow | undefined): DashboardStats {
-  return {
-    totalShown: parseInt(row?.total_shown ?? "0", 10),
-    totalQualified: parseInt(row?.total_qualified ?? "0", 10),
-    totalRejected: parseInt(row?.total_rejected ?? "0", 10),
-    totalAccepted: parseInt(row?.total_accepted ?? "0", 10),
-    totalDeclined: parseInt(row?.total_declined ?? "0", 10),
-    totalAutoAdded: parseInt(row?.total_auto_added ?? "0", 10),
-    totalCompleted: parseInt(row?.total_completed ?? "0", 10),
-    totalApiChecks: parseInt(row?.total_api_checks ?? "0", 10),
-  };
-}
-
 export async function getDashboardStats(shop: string): Promise<DashboardStats> {
-  const db = getSql();
-  const rows = await db<StatsRow[]>`
-    select
-      count(distinct reference_id) filter (
-        where event_type = 'test_shown'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_shown,
-      count(distinct reference_id) filter (
-        where event_type = 'qualified'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_qualified,
-      count(distinct reference_id) filter (
-        where event_type = 'rejected'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_rejected,
-      count(distinct reference_id) filter (
-        where event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_accepted,
-      count(distinct reference_id) filter (
-        where event_type = 'offer_declined'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_declined,
-      count(distinct reference_id) filter (
-        where event_type = 'product_auto_added'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_auto_added,
-      count(distinct reference_id) filter (
-        where event_type = 'test_completed'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_completed,
-      count(distinct reference_id) filter (
-        where event_type = 'offer_config_loaded'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_api_checks
-    from analytics_events
-    where shop = ${shop}
-  `;
-  return mapStatsRow(rows[0]);
+  return dashboardStatsFromDaily(await readDaily(shop));
 }
 
 export async function getTestAnalytics(
   shop: string,
   testId: string,
 ): Promise<DashboardStats> {
-  const db = getSql();
-  const rows = await db<StatsRow[]>`
-    select
-      count(distinct reference_id) filter (
-        where event_type = 'test_shown'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_shown,
-      count(distinct reference_id) filter (
-        where event_type = 'qualified'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_qualified,
-      count(distinct reference_id) filter (
-        where event_type = 'rejected'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_rejected,
-      count(distinct reference_id) filter (
-        where event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_accepted,
-      count(distinct reference_id) filter (
-        where event_type = 'offer_declined'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_declined,
-      count(distinct reference_id) filter (
-        where event_type = 'product_auto_added'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_auto_added,
-      count(distinct reference_id) filter (
-        where event_type = 'test_completed'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_completed,
-      count(distinct reference_id) filter (
-        where event_type = 'offer_config_loaded'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_api_checks
-    from analytics_events
-    where shop = ${shop} and test_id = ${testId}
-  `;
-  return mapStatsRow(rows[0]);
+  return dashboardStatsFromDaily(await readDaily(shop, { testId }));
 }
 
 export async function getComboSplitStats(
   shop: string,
   testId: string,
 ): Promise<ComboVariantStats[]> {
-  const db = getSql();
-  const rows = await db<
-    {
-      variant: string;
-      shown: string;
-      converted: string;
-      declined: string;
-      completed: string;
-    }[]
-  >`
-    select
-      coalesce(event_data->>'comboVariant', 'unknown') as variant,
-      count(distinct reference_id) filter (
-        where event_type = 'test_shown'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as shown,
-      count(distinct reference_id) filter (
-        where event_type in ('offer_accepted', 'trial_started', 'product_auto_added', 'qualified')
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as converted,
-      count(distinct reference_id) filter (
-        where event_type = 'offer_declined'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as declined,
-      count(distinct reference_id) filter (
-        where event_type = 'test_completed'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as completed
-    from analytics_events
-    where shop = ${shop}
-      and test_id = ${testId}
-      and event_data->>'comboVariant' is not null
-    group by 1
-    order by shown desc
-  `;
-
-  return rows.map((row) => ({
+  const daily = await readDaily(shop, { testId });
+  return daily.comboSplit.map((row) => ({
     variant: row.variant,
-    shown: parseInt(row.shown, 10),
-    converted: parseInt(row.converted, 10),
-    declined: parseInt(row.declined, 10),
-    completed: parseInt(row.completed, 10),
+    shown: row.shown,
+    converted: row.converted + (row.qualified ?? 0),
+    declined: row.declined,
+    completed: row.completed,
   }));
 }
 
@@ -443,199 +259,33 @@ export async function getFunnelStepStats(
   shop: string,
   testId: string,
 ): Promise<FunnelStepStats[]> {
-  const db = getSql();
-  const rows = await db<{ step: string; count: string }[]>`
-    select
-      coalesce(event_data->>'step', 'unknown') as step,
-      count(distinct reference_id)::text as count
-    from analytics_events
-    where shop = ${shop}
-      and test_id = ${testId}
-      and event_type = 'step_viewed'
-      and length(coalesce(reference_id, '')) >= 12
-      and coalesce(reference_id, '') !~ '^test'
-    group by 1
-    order by count(distinct reference_id) desc
-    limit 12
-  `;
-
-  return rows.map((row) => ({
-    step: row.step,
-    count: parseInt(row.count, 10),
-  }));
+  const daily = await readDaily(shop, { testId });
+  return daily.funnelSteps.slice(0, 12);
 }
 
 export async function getFunnelTypeBreakdown(
   shop: string,
   testId?: string,
 ): Promise<FunnelTypeStats[]> {
-  const db = getSql();
-
-  if (testId) {
-    const rows = await db<
-      {
-        funnel_type: string;
-        shown: string;
-        converted: string;
-        declined: string;
-        qualified: string;
-        rejected: string;
-      }[]
-    >`
-      select
-        coalesce(event_data->>'testType', event_data->>'comboVariant', 'unknown') as funnel_type,
-        count(distinct reference_id) filter (
-          where event_type = 'test_shown'
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as shown,
-        count(distinct reference_id) filter (
-          where event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as converted,
-        count(distinct reference_id) filter (
-          where event_type = 'offer_declined'
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as declined,
-        count(distinct reference_id) filter (
-          where event_type = 'qualified'
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as qualified,
-        count(distinct reference_id) filter (
-          where event_type = 'rejected'
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as rejected
-      from analytics_events
-      where shop = ${shop} and test_id = ${testId}
-      group by 1
-      order by shown desc
-    `;
-    return rows.map((row) => ({
-      funnelType: row.funnel_type,
-      shown: parseInt(row.shown, 10),
-      converted: parseInt(row.converted, 10),
-      declined: parseInt(row.declined, 10),
-      qualified: parseInt(row.qualified, 10),
-      rejected: parseInt(row.rejected, 10),
-    }));
-  }
-
-  const rows = await db<
-    {
-      funnel_type: string;
-      shown: string;
-      converted: string;
-      declined: string;
-      qualified: string;
-      rejected: string;
-    }[]
-  >`
-    select
-      coalesce(event_data->>'testType', event_data->>'comboVariant', 'unknown') as funnel_type,
-      count(distinct reference_id) filter (
-        where event_type = 'test_shown'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as shown,
-      count(distinct reference_id) filter (
-        where event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as converted,
-      count(distinct reference_id) filter (
-        where event_type = 'offer_declined'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as declined,
-      count(distinct reference_id) filter (
-        where event_type = 'qualified'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as qualified,
-      count(distinct reference_id) filter (
-        where event_type = 'rejected'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as rejected
-    from analytics_events
-    where shop = ${shop}
-    group by 1
-    order by shown desc
-  `;
-
-  return rows.map((row) => ({
-    funnelType: row.funnel_type,
-    shown: parseInt(row.shown, 10),
-    converted: parseInt(row.converted, 10),
-    declined: parseInt(row.declined, 10),
-    qualified: parseInt(row.qualified, 10),
-    rejected: parseInt(row.rejected, 10),
-  }));
+  const daily = await readDaily(shop, { testId });
+  return daily.funnelTypes;
 }
 
 export async function getTestAnalyticsSummaries(
   shop: string,
 ): Promise<TestAnalyticsSummary[]> {
-  const db = getSql();
-  const [conversionRows, funnelRows, fx] = await Promise.all([
-    fetchConversionOrderRows(shop),
-    db<
-      {
-        test_id: string;
-        shown: string;
-        converted: string;
-      }[]
-    >`
-      select
-        test_id,
-        count(distinct reference_id) filter (
-          where event_type = 'test_shown'
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as shown,
-        count(distinct reference_id) filter (
-          where event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as converted
-      from analytics_events
-      where shop = ${shop} and test_id is not null
-      group by test_id
-    `,
-    getUsdFxRates(),
-  ]);
-
-  const revenueByTest = summarizeRevenueByTest(
-    mapConversionOrderRows(conversionRows),
-    fx,
-  );
-
-  return funnelRows.map((row) => {
-    const shown = parseInt(row.shown, 10);
-    const converted = parseInt(row.converted, 10);
-    const revenue = revenueByTest.get(row.test_id);
-    const totalRevenue = revenue?.totalRevenue ?? 0;
-    const ordersWithRevenue = revenue?.ordersWithRevenue ?? 0;
-
-    return {
-      testId: row.test_id,
-      shown,
-      converted,
-      conversionRate:
-        shown > 0 ? Math.min(100, Math.round((converted / shown) * 100)) : 0,
-      totalRevenue,
-      revenuePerVisitor: computeRevenuePerVisitor(totalRevenue, shown),
-      averageOrderValue: computeAverageOrderValue(
-        totalRevenue,
-        ordersWithRevenue,
-      ),
-      currency: REPORTING_CURRENCY,
-    };
-  });
+  const daily = await readDaily(shop);
+  return daily.byTest.map((row) => ({
+    testId: row.testId,
+    shown: row.shown,
+    converted: row.converted,
+    conversionRate:
+      row.shown > 0 ? Math.min(100, Math.round((row.converted / row.shown) * 100)) : 0,
+    totalRevenue: row.revenueUsd,
+    revenuePerVisitor: computeRevenuePerVisitor(row.revenueUsd, row.shown),
+    averageOrderValue: computeAverageOrderValue(row.revenueUsd, row.ordersWithRevenue),
+    currency: REPORTING_CURRENCY,
+  }));
 }
 
 export async function getTestAnalyticsDetail(
@@ -758,88 +408,28 @@ export async function getDashboardAnalyticsDetail(
 async function loadDashboardAnalyticsDetail(
   shop: string,
 ): Promise<TestAnalyticsDetail> {
-  const db = getSql();
-
-  const [base, revenue, comboRows, funnelSteps, funnelTypeBreakdown] =
-    await Promise.all([
-      getDashboardStats(shop),
-      getRevenueStats(shop),
-      db<
-      {
-        variant: string;
-        shown: string;
-        converted: string;
-        declined: string;
-        completed: string;
-      }[]
-    >`
-      select
-        coalesce(event_data->>'comboVariant', 'unknown') as variant,
-        count(distinct reference_id) filter (
-          where event_type = 'test_shown'
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as shown,
-        count(distinct reference_id) filter (
-          where event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as converted,
-        count(distinct reference_id) filter (
-          where event_type = 'offer_declined'
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as declined,
-        count(distinct reference_id) filter (
-          where event_type = 'test_completed'
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as completed
-      from analytics_events
-      where shop = ${shop}
-        and event_data->>'comboVariant' is not null
-      group by 1
-      order by shown desc
-    `,
-    db<{ step: string; count: string }[]>`
-      select
-        coalesce(event_data->>'step', 'unknown') as step,
-        count(distinct reference_id)::text as count
-      from analytics_events
-      where shop = ${shop}
-        and event_type = 'step_viewed'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      group by 1
-      order by count(distinct reference_id) desc
-      limit 8
-    `,
-    getFunnelTypeBreakdown(shop),
-  ]);
-
-  const acceptedTotal = base.totalAccepted;
+  const daily = await readDaily(shop);
+  const base = dashboardStatsFromDaily(daily);
   const conversionRate =
     base.totalShown > 0
-      ? Math.min(100, Math.round((acceptedTotal / base.totalShown) * 100))
+      ? Math.min(100, Math.round((base.totalAccepted / base.totalShown) * 100))
       : 0;
 
   return {
-    ...attachRevenueMetrics(base, revenue),
+    ...attachRevenueMetrics(base, revenueFromDaily(daily)),
     conversionRate,
-    comboSplit: comboRows.map((row) => ({
-      variant: row.variant,
-      shown: parseInt(row.shown, 10),
-      converted: parseInt(row.converted, 10),
-      declined: parseInt(row.declined, 10),
-      completed: parseInt(row.completed, 10),
+    comboSplit: daily.comboSplit.map(({ variant, shown, converted, declined, completed }) => ({
+      variant,
+      shown,
+      converted,
+      declined,
+      completed,
     })),
-    funnelSteps: funnelSteps.map((row) => ({
-      step: row.step,
-      count: parseInt(row.count, 10),
-    })),
-    funnelTypeBreakdown,
+    funnelSteps: daily.funnelSteps.slice(0, 8),
+    funnelTypeBreakdown: daily.funnelTypes,
   };
 }
+
 
 export type AnalyticsScope = {
   /** When null, include all tests. When empty, return no rows. */
@@ -864,155 +454,6 @@ function emptyDashboardStats(): DashboardStats {
   };
 }
 
-async function fetchScopedConversionOrderRows(
-  shop: string,
-  scope: AnalyticsScope,
-  testId?: string,
-) {
-  if (!scopeHasData(scope)) return [];
-
-  const db = getSql();
-  const scopedTestIds =
-    testId != null
-      ? scope.testIds === null || scope.testIds.includes(testId)
-        ? [testId]
-        : []
-      : scope.testIds;
-
-  if (scopedTestIds !== null && scopedTestIds.length === 0) return [];
-
-  const rows = testId
-    ? await db<
-        {
-          reference_id: string;
-          test_id: string | null;
-          event_type: string;
-          event_data: unknown;
-        }[]
-      >`
-        select distinct on (reference_id)
-          reference_id,
-          test_id,
-          event_type,
-          event_data
-        from analytics_events
-        where shop = ${shop}
-          and test_id = ${testId}
-          and event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-          ${scope.since ? db`and created_at >= ${scope.since.toISOString()}` : db``}
-        order by reference_id, created_at desc
-      `
-    : await db<
-        {
-          reference_id: string;
-          test_id: string | null;
-          event_type: string;
-          event_data: unknown;
-        }[]
-      >`
-        select distinct on (reference_id)
-          reference_id,
-          test_id,
-          event_type,
-          event_data
-        from analytics_events
-        where shop = ${shop}
-          and event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-          ${scope.since ? db`and created_at >= ${scope.since.toISOString()}` : db``}
-          ${
-            scopedTestIds
-              ? db`and test_id in ${db(scopedTestIds)}`
-              : db``
-          }
-        order by reference_id, created_at desc
-      `;
-
-  try {
-    return await Promise.all(
-      rows.map((row) => resolveConversionOrderRow(shop, row)),
-    );
-  } catch (error) {
-    console.error("fetchScopedConversionOrderRows failed:", error);
-    return [];
-  }
-}
-
-async function getScopedDashboardStats(
-  shop: string,
-  scope: AnalyticsScope,
-): Promise<DashboardStats> {
-  if (!scopeHasData(scope)) return emptyDashboardStats();
-
-  const db = getSql();
-  const rows = await db<StatsRow[]>`
-    select
-      count(distinct reference_id) filter (
-        where event_type = 'test_shown'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_shown,
-      count(distinct reference_id) filter (
-        where event_type = 'qualified'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_qualified,
-      count(distinct reference_id) filter (
-        where event_type = 'rejected'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_rejected,
-      count(distinct reference_id) filter (
-        where event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_accepted,
-      count(distinct reference_id) filter (
-        where event_type = 'offer_declined'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_declined,
-      count(distinct reference_id) filter (
-        where event_type = 'product_auto_added'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_auto_added,
-      count(distinct reference_id) filter (
-        where event_type = 'test_completed'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_completed,
-      count(distinct reference_id) filter (
-        where event_type = 'offer_config_loaded'
-        and length(coalesce(reference_id, '')) >= 12
-        and coalesce(reference_id, '') !~ '^test'
-      )::text as total_api_checks
-    from analytics_events
-    where shop = ${shop}
-      ${scope.since ? db`and created_at >= ${scope.since.toISOString()}` : db``}
-      ${
-        scope.testIds
-          ? db`and test_id in ${db(scope.testIds)}`
-          : db``
-      }
-  `;
-  return mapStatsRow(rows[0]);
-}
-
-async function getScopedRevenueStats(
-  shop: string,
-  scope: AnalyticsScope,
-  testId?: string,
-): Promise<RevenueStats> {
-  const rows = mapConversionOrderRows(
-    await fetchScopedConversionOrderRows(shop, scope, testId),
-  );
-  return buildRevenueStats(rows);
-}
-
 export async function getFilteredDashboardAnalyticsDetail(
   shop: string,
   scope: AnalyticsScope,
@@ -1033,98 +474,25 @@ export async function getFilteredDashboardAnalyticsDetail(
     };
   }
 
-  const db = getSql();
-
-  const [base, revenue, comboRows, funnelSteps, funnelTypeBreakdown] =
-    await Promise.all([
-      getScopedDashboardStats(shop, scope),
-      getScopedRevenueStats(shop, scope),
-      db<
-        {
-          variant: string;
-          shown: string;
-          converted: string;
-          declined: string;
-          completed: string;
-        }[]
-      >`
-        select
-          coalesce(event_data->>'comboVariant', 'unknown') as variant,
-          count(distinct reference_id) filter (
-            where event_type = 'test_shown'
-            and length(coalesce(reference_id, '')) >= 12
-            and coalesce(reference_id, '') !~ '^test'
-          )::text as shown,
-          count(distinct reference_id) filter (
-            where event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-            and length(coalesce(reference_id, '')) >= 12
-            and coalesce(reference_id, '') !~ '^test'
-          )::text as converted,
-          count(distinct reference_id) filter (
-            where event_type = 'offer_declined'
-            and length(coalesce(reference_id, '')) >= 12
-            and coalesce(reference_id, '') !~ '^test'
-          )::text as declined,
-          count(distinct reference_id) filter (
-            where event_type = 'test_completed'
-            and length(coalesce(reference_id, '')) >= 12
-            and coalesce(reference_id, '') !~ '^test'
-          )::text as completed
-        from analytics_events
-        where shop = ${shop}
-          and event_data->>'comboVariant' is not null
-          ${scope.since ? db`and created_at >= ${scope.since.toISOString()}` : db``}
-          ${
-            scope.testIds
-              ? db`and test_id in ${db(scope.testIds)}`
-              : db``
-          }
-        group by 1
-        order by shown desc
-      `,
-      db<{ step: string; count: string }[]>`
-        select
-          coalesce(event_data->>'step', 'unknown') as step,
-          count(distinct reference_id)::text as count
-        from analytics_events
-        where shop = ${shop}
-          and event_type = 'step_viewed'
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-          ${scope.since ? db`and created_at >= ${scope.since.toISOString()}` : db``}
-          ${
-            scope.testIds
-              ? db`and test_id in ${db(scope.testIds)}`
-              : db``
-          }
-        group by 1
-        order by count(distinct reference_id) desc
-        limit 8
-      `,
-      getFunnelTypeBreakdown(shop),
-    ]);
-
-  const acceptedTotal = base.totalAccepted;
+  const daily = await readDaily(shop, { since: scope.since, testIds: scope.testIds });
+  const base = dashboardStatsFromDaily(daily);
   const conversionRate =
     base.totalShown > 0
-      ? Math.min(100, Math.round((acceptedTotal / base.totalShown) * 100))
+      ? Math.min(100, Math.round((base.totalAccepted / base.totalShown) * 100))
       : 0;
 
   return {
-    ...attachRevenueMetrics(base, revenue),
+    ...attachRevenueMetrics(base, revenueFromDaily(daily)),
     conversionRate,
-    comboSplit: comboRows.map((row) => ({
-      variant: row.variant,
-      shown: parseInt(row.shown, 10),
-      converted: parseInt(row.converted, 10),
-      declined: parseInt(row.declined, 10),
-      completed: parseInt(row.completed, 10),
+    comboSplit: daily.comboSplit.map(({ variant, shown, converted, declined, completed }) => ({
+      variant,
+      shown,
+      converted,
+      declined,
+      completed,
     })),
-    funnelSteps: funnelSteps.map((row) => ({
-      step: row.step,
-      count: parseInt(row.count, 10),
-    })),
-    funnelTypeBreakdown,
+    funnelSteps: daily.funnelSteps.slice(0, 8),
+    funnelTypeBreakdown: daily.funnelTypes,
   };
 }
 
@@ -1133,68 +501,16 @@ export async function getScopedTestAnalyticsSummaries(
   scope: AnalyticsScope,
 ): Promise<TestAnalyticsSummary[]> {
   if (!scopeHasData(scope)) return [];
-
-  const db = getSql();
-  const [conversionRows, funnelRows, fx] = await Promise.all([
-    fetchScopedConversionOrderRows(shop, scope),
-    db<
-      {
-        test_id: string;
-        shown: string;
-        converted: string;
-      }[]
-    >`
-      select
-        test_id,
-        count(distinct reference_id) filter (
-          where event_type = 'test_shown'
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as shown,
-        count(distinct reference_id) filter (
-          where event_type in ('offer_accepted', 'trial_started', 'product_auto_added')
-          and length(coalesce(reference_id, '')) >= 12
-          and coalesce(reference_id, '') !~ '^test'
-        )::text as converted
-      from analytics_events
-      where shop = ${shop}
-        and test_id is not null
-        ${scope.since ? db`and created_at >= ${scope.since.toISOString()}` : db``}
-        ${
-          scope.testIds
-            ? db`and test_id in ${db(scope.testIds)}`
-            : db``
-        }
-      group by test_id
-    `,
-    getUsdFxRates(),
-  ]);
-
-  const revenueByTest = summarizeRevenueByTest(
-    mapConversionOrderRows(conversionRows),
-    fx,
-  );
-
-  return funnelRows.map((row) => {
-    const shown = parseInt(row.shown, 10);
-    const converted = parseInt(row.converted, 10);
-    const revenue = revenueByTest.get(row.test_id);
-    const totalRevenue = revenue?.totalRevenue ?? 0;
-    const ordersWithRevenue = revenue?.ordersWithRevenue ?? 0;
-
-    return {
-      testId: row.test_id,
-      shown,
-      converted,
-      conversionRate:
-        shown > 0 ? Math.min(100, Math.round((converted / shown) * 100)) : 0,
-      totalRevenue,
-      revenuePerVisitor: computeRevenuePerVisitor(totalRevenue, shown),
-      averageOrderValue: computeAverageOrderValue(
-        totalRevenue,
-        ordersWithRevenue,
-      ),
-      currency: REPORTING_CURRENCY,
-    };
-  });
+  const daily = await readDaily(shop, { since: scope.since, testIds: scope.testIds });
+  return daily.byTest.map((row) => ({
+    testId: row.testId,
+    shown: row.shown,
+    converted: row.converted,
+    conversionRate:
+      row.shown > 0 ? Math.min(100, Math.round((row.converted / row.shown) * 100)) : 0,
+    totalRevenue: row.revenueUsd,
+    revenuePerVisitor: computeRevenuePerVisitor(row.revenueUsd, row.shown),
+    averageOrderValue: computeAverageOrderValue(row.revenueUsd, row.ordersWithRevenue),
+    currency: REPORTING_CURRENCY,
+  }));
 }

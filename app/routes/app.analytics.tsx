@@ -7,7 +7,6 @@ import { isSupabaseConfigured } from "../lib/supabase.server";
 import { listTests } from "../lib/tests.server";
 import {
   getFilteredDashboardAnalyticsDetail,
-  getFunnelTypeBreakdown,
   getScopedTestAnalyticsSummaries,
   getUsdFxRates,
   type TestAnalyticsDetail,
@@ -65,14 +64,18 @@ async function loadAnalyticsPayload(
   scope: { testIds: string[] | null; since: Date | null },
 ): Promise<AnalyticsPayload | null> {
   try {
-    const [detail, summaries, funnelTypeBreakdown, fx] = await Promise.all([
+    const [detail, summaries, fx] = await Promise.all([
       getFilteredDashboardAnalyticsDetail(shop, scope).catch(() => null),
       getScopedTestAnalyticsSummaries(shop, scope).catch(() => []),
-      getFunnelTypeBreakdown(shop).catch(() => []),
       getUsdFxRates().catch(() => null),
     ]);
     if (!detail || !fx) return null;
-    return { detail, summaries, funnelTypeBreakdown, fx };
+    return {
+      detail,
+      summaries,
+      funnelTypeBreakdown: detail.funnelTypeBreakdown ?? [],
+      fx,
+    };
   } catch (error) {
     console.error("Analytics payload failed:", error);
     return null;
